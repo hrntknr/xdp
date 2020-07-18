@@ -170,24 +170,32 @@ func init() {
 	DefaultXdpFlags = 0
 }
 
+func NewRawSocket(Ifindex int, QueueID int) (*Socket, error) {
+	xsk, err := newSocket(Ifindex, QueueID)
+	if err != nil {
+		return nil, err
+	}
+
+	xsk.freeDescs = make([]bool, NumFrames)
+	for i := 0; i < NumFrames; i++ {
+		xsk.freeDescs[i] = true
+	}
+
+	return xsk, nil
+}
+
 // NewSocket returns a new XDP socket attached to the network interface which
 // has the given interface, and attached to the given queue on that network
 // interface.
-func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
-	xsk = &Socket{fd: -1, ifindex: Ifindex}
-
-	var link netlink.Link
-
-	link, err = netlink.LinkByIndex(Ifindex)
+func NewSocket(Ifindex int, QueueID int) (*Socket, error) {
+	link, err := netlink.LinkByIndex(Ifindex)
 	if err != nil {
-		xsk.Close()
 		return nil, fmt.Errorf("netlink.GetLinkByIndex %d failed: %v\n", Ifindex, err)
 	}
 
 	// If there's XDP already attached to this link - kill it.
 	if link.Attrs() != nil && link.Attrs().Xdp != nil && link.Attrs().Xdp.Attached {
 		if err = netlink.LinkSetXdpFd(link, -1); err != nil {
-			xsk.Close()
 			return nil, fmt.Errorf("netlink.LinkSetXdpFd(link, -1) failed: %v", err)
 		}
 		// FIXME figure out a reliable way to detach and detect
@@ -195,150 +203,9 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 		time.Sleep(time.Duration(2) * time.Second)
 	}
 
-	xsk.fd, err = syscall.Socket(unix.AF_XDP, syscall.SOCK_RAW, 0)
+	xsk, err := newSocket(Ifindex, QueueID)
 	if err != nil {
-		return nil, fmt.Errorf("syscall.Socket failed: %v", err)
-	}
-
-	xsk.umem, err = syscall.Mmap(-1, 0, NumFrames*FrameSize,
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS|syscall.MAP_POPULATE)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("syscall.Mmap failed: %v", err)
-	}
-
-	xdpUmemReg := unix.XDPUmemReg{
-		Addr:     uint64(uintptr(unsafe.Pointer(&xsk.umem[0]))),
-		Len:      uint64(len(xsk.umem)),
-		Size:     FrameSize,
-		Headroom: 0,
-	}
-
-	var errno syscall.Errno
-	var rc uintptr
-
-	rc, _, errno = unix.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(xsk.fd),
-		unix.SOL_XDP, unix.XDP_UMEM_REG,
-		uintptr(unsafe.Pointer(&xdpUmemReg)),
-		unsafe.Sizeof(xdpUmemReg), 0)
-	if rc != 0 {
-		xsk.Close()
-		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_UMEM_REG failed: %v", errno)
-	}
-
-	err = syscall.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_UMEM_FILL_RING,
-		FillRingNumDescs)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_UMEM_FILL_RING failed: %v", err)
-	}
-
-	err = unix.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_UMEM_COMPLETION_RING,
-		CompletionRingNumDescs)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_UMEM_COMPLETION_RING failed: %v", err)
-	}
-
-	err = unix.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_RX_RING,
-		RxRingNumDescs)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_RX_RING failed: %v", err)
-	}
-
-	err = unix.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_TX_RING,
-		TxRingNumDescs)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_TX_RING failed: %v", err)
-	}
-
-	var offsets unix.XDPMmapOffsets
-	var vallen uint32
-	vallen = uint32(unsafe.Sizeof(offsets))
-	rc, _, errno = unix.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(xsk.fd),
-		unix.SOL_XDP, unix.XDP_MMAP_OFFSETS,
-		uintptr(unsafe.Pointer(&offsets)),
-		uintptr(unsafe.Pointer(&vallen)), 0)
-	if rc != 0 {
-		xsk.Close()
-		return nil, fmt.Errorf("unix.Syscall6 getsockopt XDP_MMAP_OFFSETS failed: %v", errno)
-	}
-
-	fillRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_UMEM_PGOFF_FILL_RING,
-		int(offsets.Fr.Desc+FillRingNumDescs*uint64(unsafe.Sizeof(uint64(0)))),
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_SHARED|syscall.MAP_POPULATE)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("syscall.Mmap XDP_UMEM_PGOFF_FILL_RING failed: %v", err)
-	}
-
-	xsk.fillRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Producer)))
-	xsk.fillRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Consumer)))
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&xsk.fillRing.Descs))
-	sh.Data = uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Desc)
-	sh.Len = FillRingNumDescs
-	sh.Cap = FillRingNumDescs
-
-	completionRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_UMEM_PGOFF_COMPLETION_RING,
-		int(offsets.Cr.Desc+CompletionRingNumDescs*uint64(unsafe.Sizeof(uint64(0)))),
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_SHARED|syscall.MAP_POPULATE)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("syscall.Mmap XDP_UMEM_PGOFF_COMPLETION_RING failed: %v", err)
-	}
-
-	xsk.completionRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&completionRingSlice[0])) + uintptr(offsets.Cr.Producer)))
-	xsk.completionRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&completionRingSlice[0])) + uintptr(offsets.Cr.Consumer)))
-	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.completionRing.Descs))
-	sh.Data = uintptr(unsafe.Pointer(&completionRingSlice[0])) + uintptr(offsets.Cr.Desc)
-	sh.Len = CompletionRingNumDescs
-	sh.Cap = CompletionRingNumDescs
-
-	rxRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_PGOFF_RX_RING,
-		int(offsets.Rx.Desc+RxRingNumDescs*uint64(unsafe.Sizeof(unix.XDPDesc{}))),
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_SHARED|syscall.MAP_POPULATE)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("syscall.Mmap XDP_PGOFF_RX_RING failed: %v", err)
-	}
-
-	xsk.rxRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Producer)))
-	xsk.rxRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Consumer)))
-	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.rxRing.Descs))
-	sh.Data = uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Desc)
-	sh.Len = RxRingNumDescs
-	sh.Cap = RxRingNumDescs
-
-	txRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_PGOFF_TX_RING,
-		int(offsets.Tx.Desc+TxRingNumDescs*uint64(unsafe.Sizeof(unix.XDPDesc{}))),
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_SHARED|syscall.MAP_POPULATE)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("syscall.Mmap XDP_PGOFF_TX_RING failed: %v", err)
-	}
-
-	xsk.txRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Producer)))
-	xsk.txRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Consumer)))
-	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.txRing.Descs))
-	sh.Data = uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Desc)
-	sh.Len = TxRingNumDescs
-	sh.Cap = TxRingNumDescs
-
-	sa := unix.SockaddrXDP{
-		Flags:   DefaultSocketFlags,
-		Ifindex: uint32(Ifindex),
-		QueueID: uint32(QueueID),
-	}
-	if err = unix.Bind(xsk.fd, &sa); err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("syscall.Bind SockaddrXDP failed: %v", err)
+		return nil, err
 	}
 
 	const BpfMapTypeXskMap = 17
@@ -491,6 +358,158 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 	xsk.freeDescs = make([]bool, NumFrames)
 	for i := 0; i < NumFrames; i++ {
 		xsk.freeDescs[i] = true
+	}
+
+	return xsk, nil
+}
+
+func newSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
+	xsk = &Socket{fd: -1, ifindex: Ifindex}
+
+	xsk.fd, err = syscall.Socket(unix.AF_XDP, syscall.SOCK_RAW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("syscall.Socket failed: %v", err)
+	}
+
+	xsk.umem, err = syscall.Mmap(-1, 0, NumFrames*FrameSize,
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS|syscall.MAP_POPULATE)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("syscall.Mmap failed: %v", err)
+	}
+
+	xdpUmemReg := unix.XDPUmemReg{
+		Addr:     uint64(uintptr(unsafe.Pointer(&xsk.umem[0]))),
+		Len:      uint64(len(xsk.umem)),
+		Size:     FrameSize,
+		Headroom: 0,
+	}
+
+	var errno syscall.Errno
+	var rc uintptr
+
+	rc, _, errno = unix.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(xsk.fd),
+		unix.SOL_XDP, unix.XDP_UMEM_REG,
+		uintptr(unsafe.Pointer(&xdpUmemReg)),
+		unsafe.Sizeof(xdpUmemReg), 0)
+	if rc != 0 {
+		xsk.Close()
+		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_UMEM_REG failed: %v", errno)
+	}
+
+	err = syscall.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_UMEM_FILL_RING,
+		FillRingNumDescs)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_UMEM_FILL_RING failed: %v", err)
+	}
+
+	err = unix.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_UMEM_COMPLETION_RING,
+		CompletionRingNumDescs)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_UMEM_COMPLETION_RING failed: %v", err)
+	}
+
+	err = unix.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_RX_RING,
+		RxRingNumDescs)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_RX_RING failed: %v", err)
+	}
+
+	err = unix.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_TX_RING,
+		TxRingNumDescs)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_TX_RING failed: %v", err)
+	}
+
+	var offsets unix.XDPMmapOffsets
+	var vallen uint32
+	vallen = uint32(unsafe.Sizeof(offsets))
+	rc, _, errno = unix.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(xsk.fd),
+		unix.SOL_XDP, unix.XDP_MMAP_OFFSETS,
+		uintptr(unsafe.Pointer(&offsets)),
+		uintptr(unsafe.Pointer(&vallen)), 0)
+	if rc != 0 {
+		xsk.Close()
+		return nil, fmt.Errorf("unix.Syscall6 getsockopt XDP_MMAP_OFFSETS failed: %v", errno)
+	}
+
+	fillRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_UMEM_PGOFF_FILL_RING,
+		int(offsets.Fr.Desc+FillRingNumDescs*uint64(unsafe.Sizeof(uint64(0)))),
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED|syscall.MAP_POPULATE)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("syscall.Mmap XDP_UMEM_PGOFF_FILL_RING failed: %v", err)
+	}
+
+	xsk.fillRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Producer)))
+	xsk.fillRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Consumer)))
+	sh := (*reflect.SliceHeader)(unsafe.Pointer(&xsk.fillRing.Descs))
+	sh.Data = uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Desc)
+	sh.Len = FillRingNumDescs
+	sh.Cap = FillRingNumDescs
+
+	completionRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_UMEM_PGOFF_COMPLETION_RING,
+		int(offsets.Cr.Desc+CompletionRingNumDescs*uint64(unsafe.Sizeof(uint64(0)))),
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED|syscall.MAP_POPULATE)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("syscall.Mmap XDP_UMEM_PGOFF_COMPLETION_RING failed: %v", err)
+	}
+
+	xsk.completionRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&completionRingSlice[0])) + uintptr(offsets.Cr.Producer)))
+	xsk.completionRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&completionRingSlice[0])) + uintptr(offsets.Cr.Consumer)))
+	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.completionRing.Descs))
+	sh.Data = uintptr(unsafe.Pointer(&completionRingSlice[0])) + uintptr(offsets.Cr.Desc)
+	sh.Len = CompletionRingNumDescs
+	sh.Cap = CompletionRingNumDescs
+
+	rxRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_PGOFF_RX_RING,
+		int(offsets.Rx.Desc+RxRingNumDescs*uint64(unsafe.Sizeof(unix.XDPDesc{}))),
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED|syscall.MAP_POPULATE)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("syscall.Mmap XDP_PGOFF_RX_RING failed: %v", err)
+	}
+
+	xsk.rxRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Producer)))
+	xsk.rxRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Consumer)))
+	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.rxRing.Descs))
+	sh.Data = uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Desc)
+	sh.Len = RxRingNumDescs
+	sh.Cap = RxRingNumDescs
+
+	txRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_PGOFF_TX_RING,
+		int(offsets.Tx.Desc+TxRingNumDescs*uint64(unsafe.Sizeof(unix.XDPDesc{}))),
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED|syscall.MAP_POPULATE)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("syscall.Mmap XDP_PGOFF_TX_RING failed: %v", err)
+	}
+
+	xsk.txRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Producer)))
+	xsk.txRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Consumer)))
+	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.txRing.Descs))
+	sh.Data = uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Desc)
+	sh.Len = TxRingNumDescs
+	sh.Cap = TxRingNumDescs
+
+	sa := unix.SockaddrXDP{
+		Flags:   DefaultSocketFlags,
+		Ifindex: uint32(Ifindex),
+		QueueID: uint32(QueueID),
+	}
+	if err = unix.Bind(xsk.fd, &sa); err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("syscall.Bind SockaddrXDP failed: %v", err)
 	}
 
 	return xsk, nil
